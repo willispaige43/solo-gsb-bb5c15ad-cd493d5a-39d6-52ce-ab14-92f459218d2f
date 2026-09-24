@@ -1,0 +1,9 @@
+{
+  "datum_points": ["A"],
+  "measure_points": ["B", "C"],
+  "constraints": [
+    {"id": "c1", "start": "A", "end": "B", "lower": 0, "upper": 10},
+    {"id": "c2", "start": "A", "end": "C", "lower": 0, "upper": 10},
+    {"id": "c3", "start": "B", "end": "C", "lower": 5, "upper": 5}
+  ]
+}
