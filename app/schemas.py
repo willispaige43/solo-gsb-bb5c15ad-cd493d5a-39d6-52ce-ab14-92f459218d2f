@@ -74,6 +74,35 @@ class ChainRequest(BaseModel):
         return [_strip("点编号", v) for v in values]
 
 
+class ReconcileRequest(ChainRequest):
+    """读数校正请求：沿用尺寸链校核请求，并附各测点的实测读数。
+
+    ``readings`` 以测点编号为键、整数微米读数为值，键集合必须与
+    ``measure_points`` 完全一致：不得缺漏测点，也不得包含基准点或额外测点。
+    """
+
+    readings: dict[PointId, StrictInt] = Field(
+        ...,
+        description=(
+            "以测点编号为键的整数微米（µm）实测读数；键集合必须恰好覆盖 "
+            "measure_points 中的全部测点"
+        ),
+    )
+
+    @field_validator("readings")
+    @classmethod
+    def _strip_reading_keys(cls, values: dict[str, int]) -> dict[str, int]:
+        stripped: dict[str, int] = {}
+        for key, value in values.items():
+            name = _strip("readings 的测点编号", key)
+            if name in stripped:
+                raise ValueError(
+                    f"readings 中的测点编号 {name!r} 在去除首尾空白后重复"
+                )
+            stripped[name] = value
+        return stripped
+
+
 class CycleEdge(BaseModel):
     """矛盾闭环中一条边的溯源信息。
 
@@ -127,6 +156,51 @@ class RangesResponse(BaseModel):
             "各测点的全局紧界，按请求 measure_points 的顺序列出；"
             "每个端点都由某组全局可行坐标达到，但不同测点的端点不要求由同一组坐标同时达到"
         ),
+    )
+
+
+class PointCorrection(BaseModel):
+    """单个测点的读数校正明细。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: PointId = Field(..., description="测点编号（与请求 measure_points 一致）")
+    reading: StrictInt = Field(..., description="该测点的实测读数（整数微米）")
+    corrected_coordinate: StrictInt = Field(
+        ..., description="该测点的校正坐标（整数微米，含端点）"
+    )
+    correction: StrictInt = Field(
+        ...,
+        description=(
+            "逐点校正量 corrected_coordinate − reading（整数微米，带符号）；"
+            "其绝对值不超过 max_abs_correction"
+        ),
+    )
+
+
+class ReconcileResponse(BaseModel):
+    """可行时返回：最小统一容差 e、同一组可行校正坐标与逐点校正量。"""
+
+    status: Literal["feasible"] = "feasible"
+    unit: Literal["um"] = "um"
+    max_abs_correction: StrictInt = Field(
+        ...,
+        ge=0,
+        description=(
+            "最小的非负整数 e：存在一组满足全部约束（含基准点固定为 0）的"
+            "整数坐标，使每个测点都满足 |校正坐标 − 读数| ≤ e"
+        ),
+    )
+    coordinates: dict[PointId, StrictInt] = Field(
+        ...,
+        description=(
+            "达到该最小 e 的同一组可行整数坐标（微米），包含全部基准点（为 0）"
+            "与测点"
+        ),
+    )
+    corrections: list[PointCorrection] = Field(
+        ...,
+        description="逐测点的读数、校正坐标与校正量，按请求 measure_points 顺序列出"
     )
 
 

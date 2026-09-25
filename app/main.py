@@ -13,11 +13,21 @@ from .schemas import (
     CycleEdge,
     FeasibleResponse,
     InfeasibleResponse,
+    PointCorrection,
     PointRange,
     RangesResponse,
+    ReconcileRequest,
+    ReconcileResponse,
     ValidationErrorResponse,
 )
-from .solver import Edge, SolveResult, ValidationError, solve, solve_ranges
+from .solver import (
+    Edge,
+    SolveResult,
+    ValidationError,
+    solve,
+    solve_ranges,
+    solve_reconcile,
+)
 
 logger = logging.getLogger("dimchain")
 
@@ -120,6 +130,35 @@ def ranges_chain(req: ChainRequest):
         for p, (lo, hi) in result.ranges.items()
     ]
     return RangesResponse(ranges=items)
+
+
+@app.post(
+    "/api/v1/chains/reconcile",
+    response_model=ReconcileResponse | InfeasibleResponse,
+    summary="依据实测读数求最小统一校正量",
+    responses={422: {"model": ValidationErrorResponse}},
+    tags=["chains"],
+)
+def reconcile_chain(req: ReconcileRequest):
+    result = solve_reconcile(req)
+    if not result.feasible:
+        return _build_infeasible(result)
+
+    # 同一组可行校正坐标 + 逐点校正量，按请求测点顺序列出
+    corrections = [
+        PointCorrection(
+            id=p,
+            reading=req.readings[p],
+            corrected_coordinate=result.coordinates[p],
+            correction=result.coordinates[p] - req.readings[p],
+        )
+        for p in req.measure_points
+    ]
+    return ReconcileResponse(
+        max_abs_correction=result.max_abs_correction,  # type: ignore[arg-type]
+        coordinates=result.coordinates,
+        corrections=corrections,
+    )
 
 
 @app.get("/healthz", tags=["meta"], summary="健康检查")
