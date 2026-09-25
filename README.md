@@ -8,8 +8,12 @@
 
 - **无负环（可行）**：所有公差能同时满足，`/check` 返回以基准点为零的各点整数坐标；
   `/ranges` 进一步返回每个测点在全部约束同时成立时可分别达到的**最小/最大整数坐标紧界**；
+  `/reconcile` 额外接收各测点的整数微米**读数**，求最小非负整数 `e`，使存在一组满足
+  全部约束的校正坐标让所有测点 `|校正坐标 − 读数| ≤ e`，并返回 `e`、该组校正坐标
+  与逐点校正量；
 - **有负环（不可行）**：沿负环累加得到 `0 ≤ 负数` 的矛盾，返回构成该矛盾
-  闭环的**原始约束编号**及逐边明细，便于定位尺寸链中的过约束环节。
+  闭环的**原始约束编号**及逐边明细，便于定位尺寸链中的过约束环节
+  （三个接口返回同一格式的矛盾闭环）。
 
 ## 单条启动命令
 
@@ -26,6 +30,7 @@ docker compose up --build -d
 | 健康检查 | <http://localhost:8000/healthz> |
 | 可行性校核接口 | `POST http://localhost:8000/api/v1/chains/check` |
 | 测点坐标紧界接口 | `POST http://localhost:8000/api/v1/chains/ranges` |
+| 读数最小校正接口 | `POST http://localhost:8000/api/v1/chains/reconcile` |
 | Swagger UI（在线试调） | <http://localhost:8000/docs> |
 | OpenAPI Schema | <http://localhost:8000/openapi.json> |
 
@@ -63,6 +68,11 @@ curl -s -X POST http://localhost:8000/api/v1/chains/ranges \
   -H 'Content-Type: application/json' \
   -d @examples/ranges.json | python -m json.tool
 
+# 读数校正：返回最小校正半径 e、同一组可行校正坐标与逐点校正量
+curl -s -X POST http://localhost:8000/api/v1/chains/reconcile \
+  -H 'Content-Type: application/json' \
+  -d @examples/reconcile.json | python -m json.tool
+
 # 不可行：返回矛盾闭环的约束编号
 curl -s -X POST http://localhost:8000/api/v1/chains/check \
   -H 'Content-Type: application/json' \
@@ -77,7 +87,8 @@ curl -s -X POST http://localhost:8000/api/v1/chains/check \
 ## 请求与响应
 
 `/api/v1/chains/check` 与 `/api/v1/chains/ranges` 的请求体、静态校验规则
-（含下文 422 错误码）完全一致。
+（含下文 422 错误码）完全一致；`/api/v1/chains/reconcile` 在此之上增加
+`readings` 字段（见下文专节）。
 
 ### 请求体 `POST /api/v1/chains/check`（`/ranges` 同）
 
@@ -163,6 +174,51 @@ c1/c2 则 B、C 各为 `[0,10]`，但 c3 要求 `C − B = 5`，跨测点约束�
 - 多个基准点互钉为 0 的固定关系、跨测点约束、负权边（反向公差）均已纳入推导，
   界为包含负数的整数闭区间（如 `{"minimum": -12, "maximum": -10}`）。
 
+### `POST /api/v1/chains/reconcile`：读数最小校正
+
+请求体在 `/check` 的基础上**增加 `readings` 字段**，其余字段、静态校验规则
+完全相同（`examples/reconcile.json`）：
+
+```json
+{
+  "datum_points": ["A"],
+  "measure_points": ["B", "C"],
+  "constraints": [
+    {"id": "c1", "start": "A", "end": "B", "lower": 10, "upper": 12},
+    {"id": "c2", "start": "B", "end": "C", "lower": 5, "upper": 8}
+  ],
+  "readings": {"B": 10, "C": 19}
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `readings` | object | 测点编号 → **整数** µm 读数；必须**恰好覆盖全部测点**：缺漏报 `missing_reading`、多出非测点键（未知点或基准点）报 `extra_reading`（均 422）；非整数读数由 Pydantic 拦截（422）。键会自动去除首尾空白 |
+
+语义：若原尺寸约束本身无解，返回与 `/check` **完全相同**的 `InfeasibleResponse`
+（矛盾闭环，与读数无关）。有解时，求**最小非负整数 `e`**，使存在一组满足全部
+约束（含基准点为 0）的整数校正坐标，让所有测点**同时**满足
+`|校正坐标 − 读数| ≤ e`，返回 200：
+
+```json
+{
+  "status": "feasible",
+  "unit": "um",
+  "e": 1,
+  "coordinates": {"A": 0, "B": 11, "C": 19},
+  "corrections": {"B": 1, "C": 0}
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `e` | 最小非负整数校正半径（µm）：`e` 可行而 `e−1` 不可行（全局最优，而非逐点各自最优） |
+| `coordinates` | 一组达到 `e` 的可行校正坐标（全部约束、基准点为 0 均成立；基准点坐标恒为 0） |
+| `corrections` | 逐测点校正量 = 校正坐标 − 读数（整数 µm）；与 `coordinates` 来自**同一组**坐标，绝对值均 `≤ e` 且最大值恰为 `e` |
+
+上例中读数 `B=10、C=19` 要求 `C − B = 9`，但 c2 只允许 `[5,8]`，故 `e=0`
+不可行；`e=1` 时 `B=11、C=19` 同时满足 c1、c2，即最小校正半径为 1。
+
 ### 响应二：不可行（HTTP 200）
 
 ```json
@@ -214,6 +270,8 @@ c1/c2 则 B、C 各为 `[0,10]`，但 c3 要求 `C − B = 5`，跨测点约束�
 | `point_not_connected_to_datum` | 测点在无向意义下未连到任何基准点，坐标无法确定 |
 | `duplicate_point` / `duplicate_constraint` | 点编号或约束编号重复 |
 | `point_role_conflict` | 同一点同时出现在基准点和测点中 |
+| `missing_reading` | （仅 `/reconcile`）`readings` 缺少某个测点的读数 |
+| `extra_reading` | （仅 `/reconcile`）`readings` 含有非测点键（未知点或基准点） |
 
 此外，字段缺失、类型错误（如公差给了小数 `1.5`）、多余字段等由
 Pydantic 拦截，同样返回 HTTP 422。
@@ -242,6 +300,14 @@ Pydantic 拦截，同样返回 HTTP 422。
 
 两组极值距离各自给出一组满足全部不等式的全局可行坐标（全部基准点为 0），
 因此上下界均可达到、是紧界；整数边权保证端点为整数微米。复杂度 O(|V|·|E|)。
+
+`/reconcile` 在尺寸约束可行后，把每个测点 `p` 的读数 `r_p` 写成区间约束
+`x_p ∈ [r_p − e, r_p + e]`，即两条差分边并入差分图：`anchor→p` 权 `r_p + e`、
+`p→anchor` 权 `e − r_p`。给定 `e` 的可行性仍由 Bellman–Ford 负环判定；
+`e` 增大只会放宽区间，可行性关于 `e` 单调，故以基准可行解（原图最短路坐标）
+与读数的最大偏差为上界**二分最小可行 `e`**（该上界本身即一个可行 `e`）。
+最后在最小 `e` 的图上取最短路坐标，作为返回的同一组可行校正坐标，
+逐点校正量 = 校正坐标 − 读数。整数边权保证二分得到的 `e` 与坐标均为整数。
 
 ## 项目结构
 

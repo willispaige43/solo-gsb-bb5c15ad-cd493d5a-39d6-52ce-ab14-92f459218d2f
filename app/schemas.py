@@ -74,6 +74,24 @@ class ChainRequest(BaseModel):
         return [_strip("点编号", v) for v in values]
 
 
+class ReconcileRequest(ChainRequest):
+    """读数校正请求：尺寸链约束 + 各测点的整数微米读数。
+
+    ``readings`` 以测点编号为键，必须恰好覆盖全部 ``measure_points``
+    （缺漏 / 多余由领域校验以 422 返回）；读数必须是整数微米。
+    """
+
+    readings: dict[PointId, StrictInt] = Field(
+        ...,
+        description="测点编号 -> 整数微米读数；必须恰好覆盖全部 measure_points",
+    )
+
+    @field_validator("readings")
+    @classmethod
+    def _strip_reading_keys(cls, values: dict[str, int]) -> dict[str, int]:
+        return {_strip("读数键", k): r for k, r in values.items()}
+
+
 class CycleEdge(BaseModel):
     """矛盾闭环中一条边的溯源信息。
 
@@ -126,6 +144,31 @@ class RangesResponse(BaseModel):
         description=(
             "各测点的全局紧界，按请求 measure_points 的顺序列出；"
             "每个端点都由某组全局可行坐标达到，但不同测点的端点不要求由同一组坐标同时达到"
+        ),
+    )
+
+
+class ReconcileResponse(BaseModel):
+    """读数校正结果：最小校正半径 e 与达到 e 的同一组可行校正坐标。"""
+
+    status: Literal["feasible"] = "feasible"
+    unit: Literal["um"] = "um"
+    e: StrictInt = Field(
+        ...,
+        ge=0,
+        description=(
+            "最小非负整数校正半径（微米）：存在满足全部约束（含基准点为 0）的"
+            "整数校正坐标使所有测点 |校正坐标 − 读数| ≤ e，且 e−1 不可行"
+        ),
+    )
+    coordinates: dict[PointId, StrictInt] = Field(
+        ..., description="一组达到 e 的可行校正坐标（基准点为 0，整数微米）"
+    )
+    corrections: dict[PointId, StrictInt] = Field(
+        ...,
+        description=(
+            "逐测点校正量 = 校正坐标 − 读数（整数微米）；与 coordinates 来自"
+            "同一组坐标，绝对值均 ≤ e 且最大值恰为 e"
         ),
     )
 

@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from app.schemas import ChainRequest, ConstraintIn
-from app.solver import ValidationError, solve, solve_ranges, validate_request
+from app.schemas import ChainRequest, ConstraintIn, ReconcileRequest
+from app.solver import (
+    ValidationError,
+    solve,
+    solve_ranges,
+    solve_reconcile,
+    validate_request,
+)
 
 
 def C(cid: str, start: str, end: str, lower: int, upper: int) -> ConstraintIn:
@@ -17,6 +23,15 @@ def req(datum, measure, constraints) -> ChainRequest:
         datum_points=list(datum),
         measure_points=list(measure),
         constraints=list(constraints),
+    )
+
+
+def rreq(datum, measure, constraints, readings) -> ReconcileRequest:
+    return ReconcileRequest(
+        datum_points=list(datum),
+        measure_points=list(measure),
+        constraints=list(constraints),
+        readings=dict(readings),
     )
 
 
@@ -306,3 +321,129 @@ def test_strips_whitespace():
     r = req([" A "], [" B "], [C(" c1 ", "A", "B", 1, 2)])
     res = solve(r)
     assert res.feasible and res.coordinates["A"] == 0 and res.coordinates["B"] == 2
+
+
+# ---------- 读数校正 solve_reconcile ----------
+
+def _assert_reconcile_consistent(r: ReconcileRequest, res) -> None:
+    """返回坐标必须全局可行，校正量与坐标/读数一致且最大值恰为 e。"""
+    coords = res.coordinates
+    for d in r.datum_points:
+        assert coords[d] == 0
+    for c in r.constraints:
+        assert c.lower <= coords[c.end] - coords[c.start] <= c.upper
+    for p in r.measure_points:
+        assert res.corrections[p] == coords[p] - r.readings[p]
+        assert abs(res.corrections[p]) <= res.e
+    assert max(abs(res.corrections[p]) for p in r.measure_points) == res.e
+
+
+def test_reconcile_zero_when_readings_already_feasible():
+    # 读数本身就是一组可行坐标：e = 0，校正坐标与读数完全一致
+    r = rreq(
+        ["A"], ["B", "C"],
+        [C("c1", "A", "B", 10, 12), C("c2", "B", "C", 5, 8)],
+        {"B": 11, "C": 17},
+    )
+    res = solve_reconcile(r)
+    assert res.feasible and res.e == 0
+    assert res.coordinates == {"A": 0, "B": 11, "C": 17}
+    assert res.corrections == {"B": 0, "C": 0}
+    _assert_reconcile_consistent(r, res)
+
+
+def test_reconcile_minimal_e_shared_coordinates():
+    # B∈[10,12]、C-B∈[5,8]，读数 B=10、C=19：e=0 需 C-B=9 不可行；
+    # e=1 时 B=11、C=19 可行，且校正量来自同一组坐标
+    r = rreq(
+        ["A"], ["B", "C"],
+        [C("c1", "A", "B", 10, 12), C("c2", "B", "C", 5, 8)],
+        {"B": 10, "C": 19},
+    )
+    res = solve_reconcile(r)
+    assert res.feasible and res.e == 1
+    assert res.coordinates == {"A": 0, "B": 11, "C": 19}
+    assert res.corrections == {"B": 1, "C": 0}
+    _assert_reconcile_consistent(r, res)
+
+
+def test_reconcile_coupled_points_share_error_budget():
+    # 精确约束 C-B=10 把两点耦合：读数 B=0、C=13 的 3µm 偏差由两点分摊，
+    # 实数最优 e=1.5，整数坐标下最小 e=2（如 B=2、C=12）
+    r = rreq(
+        ["A"], ["B", "C"],
+        [C("c1", "A", "B", 0, 10), C("c2", "B", "C", 10, 10)],
+        {"B": 0, "C": 13},
+    )
+    res = solve_reconcile(r)
+    assert res.feasible and res.e == 2
+    _assert_reconcile_consistent(r, res)
+
+
+def test_reconcile_negative_readings_and_coordinates():
+    # B 落在负半轴，读数也在负半轴
+    r = rreq(["A"], ["B"], [C("c1", "A", "B", -12, -10)], {"B": -20})
+    res = solve_reconcile(r)
+    assert res.feasible and res.e == 8  # 最近可行点 -12，|−12 − (−20)| = 8
+    assert res.coordinates["B"] == -12
+    assert res.corrections == {"B": 8}
+    _assert_reconcile_consistent(r, res)
+
+
+def test_reconcile_multiple_datums_pinned():
+    r = rreq(
+        ["D1", "D2"], ["M"],
+        [C("c1", "D1", "M", 3, 7), C("c2", "M", "D2", -7, -3)],
+        {"M": 5},
+    )
+    res = solve_reconcile(r)
+    assert res.feasible and res.e == 0
+    assert res.coordinates["D1"] == 0 and res.coordinates["D2"] == 0
+    _assert_reconcile_consistent(r, res)
+
+
+def test_reconcile_infeasible_returns_same_cycle_as_solve():
+    # 原尺寸约束无解：与 /check 完全相同的矛盾闭环，读数不影响结论
+    constraints = [C("c1", "A", "B", 9, 10), C("c2", "B", "C", 9, 10), C("c3", "C", "A", -1, 0)]
+    r = rreq(["A"], ["B", "C"], constraints, {"B": 1, "C": 2})
+    res = solve_reconcile(r)
+    assert not res.feasible
+    assert res.e is None and res.corrections is None
+    base = solve(req(["A"], ["B", "C"], constraints))
+    assert not base.feasible
+    assert res.cycle_weight == base.cycle_weight
+    assert [e.cid for e in res.cycle_edges] == [e.cid for e in base.cycle_edges]
+
+
+def test_reconcile_readings_validation_codes():
+    # 缺漏 + 额外（含基准点键与未知键）一次性全部上报
+    r = rreq(
+        ["A"], ["B", "C"],
+        [C("c1", "A", "B", 1, 2), C("c2", "B", "C", 1, 2)],
+        {"B": 1, "A": 0, "X": 3},
+    )
+    with pytest.raises(ValidationError) as ei:
+        validate_request(r, r.readings)
+    errs = ei.value.errors
+    assert {e["code"] for e in errs} == {"missing_reading", "extra_reading"}
+    missing = [e for e in errs if e["code"] == "missing_reading"]
+    extra = [e for e in errs if e["code"] == "extra_reading"]
+    assert [e["location"] for e in missing] == [["readings", "C"]]
+    assert [e["location"] for e in extra] == [["readings", "A"], ["readings", "X"]]
+
+
+def test_reconcile_solve_raises_on_bad_readings():
+    r = rreq(["A"], ["B"], [C("c1", "A", "B", 1, 2)], {})
+    with pytest.raises(ValidationError):
+        solve_reconcile(r)
+
+
+def test_reconcile_reading_keys_stripped():
+    r = ReconcileRequest(
+        datum_points=["A"],
+        measure_points=["B"],
+        constraints=[C("c1", "A", "B", 1, 2)],
+        readings={" B ": 2},
+    )
+    res = solve_reconcile(r)
+    assert res.feasible and res.e == 0 and res.corrections == {"B": 0}

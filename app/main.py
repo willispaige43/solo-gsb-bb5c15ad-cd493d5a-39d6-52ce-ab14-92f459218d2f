@@ -15,9 +15,11 @@ from .schemas import (
     InfeasibleResponse,
     PointRange,
     RangesResponse,
+    ReconcileRequest,
+    ReconcileResponse,
     ValidationErrorResponse,
 )
-from .solver import Edge, SolveResult, ValidationError, solve, solve_ranges
+from .solver import Edge, SolveResult, ValidationError, solve, solve_ranges, solve_reconcile
 
 logger = logging.getLogger("dimchain")
 
@@ -27,6 +29,9 @@ app = FastAPI(
         "客户端提交基准点、测点及有向尺寸约束（终点减起点的整数微米差上下限），"
         "服务端将界限转为差分约束并判定公差能否同时成立；可行时返回以基准点为零"
         "的各点坐标，不可行时返回构成矛盾闭环的原始约束编号。"
+        "/reconcile 额外接收各测点的整数微米读数，在约束有解时求最小非负整数 e，"
+        "使存在一组可行校正坐标让所有测点 |校正坐标−读数| ≤ e，并返回 e、"
+        "该组校正坐标与逐点校正量。"
     ),
     version=__version__,
 )
@@ -120,6 +125,24 @@ def ranges_chain(req: ChainRequest):
         for p, (lo, hi) in result.ranges.items()
     ]
     return RangesResponse(ranges=items)
+
+
+@app.post(
+    "/api/v1/chains/reconcile",
+    response_model=ReconcileResponse | InfeasibleResponse,
+    summary="校核尺寸链并求各测点读数的最小校正半径",
+    responses={422: {"model": ValidationErrorResponse}},
+    tags=["chains"],
+)
+def reconcile_chain(req: ReconcileRequest):
+    result = solve_reconcile(req)
+    if not result.feasible:
+        return _build_infeasible(result)
+    return ReconcileResponse(
+        e=result.e,
+        coordinates=result.coordinates,
+        corrections=result.corrections,
+    )
 
 
 @app.get("/healthz", tags=["meta"], summary="健康检查")

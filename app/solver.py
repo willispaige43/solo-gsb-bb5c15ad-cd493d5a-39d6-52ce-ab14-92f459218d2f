@@ -28,6 +28,20 @@
 跨测点约束、多个基准点互钉为 0 的 pin 边、负权边均已在图中，故这是
 纳入全部固定关系后的全局紧界；各测点的端点不必由同一组坐标同时达到。
 整数权 ⇒ 最短路距离为整数，紧界本身即整数微米坐标。
+
+读数校正（``solve_reconcile``）
+------------------------------
+在尺寸约束本身可行的前提下，把每个测点 ``p`` 的整数微米读数 ``r_p``
+写成区间约束 ``x_p ∈ [r_p − e, r_p + e]``，即两条差分边并入差分图：
+
+* ``x_p − x_anchor ≤ r_p + e`` → 边 anchor→p，权 ``r_p + e``
+* ``x_anchor − x_p ≤ e − r_p`` → 边 p→anchor，权 ``e − r_p``
+
+给定 ``e`` 的可行性仍由 Bellman-Ford 负环判定；``e`` 增大只会放宽区间，
+可行性关于 ``e`` 单调，故可二分最小的可行非负整数 ``e``。上界取基准可行解
+（原图最短路坐标）与读数的最大偏差——该偏差本身即一个可行 ``e``。
+最后在最小 ``e`` 的图上取最短路坐标，作为返回的**同一组**可行校正坐标，
+逐点校正量 = 校正坐标 − 读数。
 """
 
 from __future__ import annotations
@@ -35,7 +49,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 
-from .schemas import ChainRequest, ConstraintIn
+from .schemas import ChainRequest, ConstraintIn, ReconcileRequest
 
 INF: int = 10**30
 
@@ -53,10 +67,10 @@ class Edge:
     fr: str  # 差分图边起点
     to: str  # 差分图边终点
     weight: int
-    cid: str | None  # 原始约束编号；基准点固定边为 None
-    bound: str  # "upper" | "lower" | "datum_pin"
-    start: str | None  # 原始约束起点（pin 边为 None）
-    end: str | None  # 原始约束终点（pin 边为 None）
+    cid: str | None  # 原始约束编号；基准点固定边 / 读数区间边为 None
+    bound: str  # "upper" | "lower" | "datum_pin" | "reading"
+    start: str | None  # 原始约束起点（pin / reading 边为 None）
+    end: str | None  # 原始约束终点（pin / reading 边为 None）
 
 
 @dataclass
@@ -68,6 +82,9 @@ class SolveResult:
     cycle_weight: int
     # solve_ranges 可行时：测点编号 -> (最小坐标, 最大坐标)
     ranges: dict[str, tuple[int, int]] | None = None
+    # solve_reconcile 可行时：最小非负整数校正半径 e 与逐测点校正量（校正坐标 − 读数）
+    e: int | None = None
+    corrections: dict[str, int] | None = None
 
 
 def _err(code: str, message: str, location: list, constraint_id: str | None = None) -> dict:
@@ -81,8 +98,14 @@ def _err(code: str, message: str, location: list, constraint_id: str | None = No
     return item
 
 
-def validate_request(req: ChainRequest) -> None:
-    """执行与求解无关的静态校验，收集全部错误后一次性抛出。"""
+def validate_request(
+    req: ChainRequest, readings: dict[str, int] | None = None
+) -> None:
+    """执行与求解无关的静态校验，收集全部错误后一次性抛出。
+
+    ``readings`` 非空时（/reconcile）额外校验读数恰好覆盖全部测点：
+    缺漏报 ``missing_reading``，多出非测点键报 ``extra_reading``。
+    """
     errors: list[dict] = []
 
     datum = req.datum_points
@@ -191,6 +214,27 @@ def validate_request(req: ChainRequest) -> None:
                         "point_not_connected_to_datum",
                         f"测点 {p!r} 未通过任何约束链连接到基准点，无法确定其坐标",
                         ["measure_points", i],
+                    )
+                )
+
+    # /reconcile：读数须恰好覆盖全部测点（不多不少）
+    if readings is not None:
+        for p in dict.fromkeys(measure):
+            if p not in readings:
+                errors.append(
+                    _err(
+                        "missing_reading",
+                        f"测点 {p!r} 缺少读数：readings 须恰好覆盖全部测点",
+                        ["readings", p],
+                    )
+                )
+        for k in readings:
+            if k not in seen_m:
+                errors.append(
+                    _err(
+                        "extra_reading",
+                        f"读数键 {k!r} 不是已声明的测点（readings 仅接受测点编号）",
+                        ["readings", k],
                     )
                 )
 
@@ -321,3 +365,68 @@ def solve_ranges(req: ChainRequest) -> SolveResult:
         # -lower_dist[p] ≤ x_p ≤ upper_dist[p]
         ranges[p] = (-int(lower_dist[p]), int(upper_dist[p]))
     return SolveResult(True, coordinates, [], 0, ranges)
+
+
+def _reading_edges(
+    measure_points: list[str], readings: dict[str, int], anchor: str, e: int
+) -> list[Edge]:
+    """读数区间边：x_p ∈ [r_p − e, r_p + e]（相对 anchor 零位）。
+
+    顺序固定（按请求测点顺序），保证求解结果确定。
+    """
+    edges: list[Edge] = []
+    for p in measure_points:
+        r = readings[p]
+        edges.append(Edge(anchor, p, r + e, None, "reading", None, None))
+        edges.append(Edge(p, anchor, e - r, None, "reading", None, None))
+    return edges
+
+
+def solve_reconcile(req: ReconcileRequest) -> SolveResult:
+    """读数校正：原尺寸约束无解时返回与 solve 相同的矛盾闭环；有解时求
+    最小非负整数 e，使存在一组满足全部约束（含基准点为 0）的整数校正坐标，
+    让所有测点同时满足 |校正坐标 − 读数| ≤ e，并返回该校正坐标与逐点校正量。
+
+    读数区间 [r_p − e, r_p + e] 转成两条差分边并入差分图；e 增大只放宽
+    区间，可行性关于 e 单调，故以基准可行解（原图最短路坐标）与读数的
+    最大偏差为上界，二分最小可行 e。
+    """
+    validate_request(req, req.readings)
+
+    anchor = req.datum_points[0]
+    nodes = list(dict.fromkeys([*req.datum_points, *req.measure_points]))
+    edges = _build_edges(req, anchor)
+
+    dist, pred, bad_edge = _bellman_ford(nodes, edges, anchor)
+    if bad_edge is not None:
+        # 原尺寸约束本身无解：与读数无关，直接返回矛盾闭环
+        cycle = _extract_cycle(pred, bad_edge, len(nodes))
+        return SolveResult(False, {}, cycle, sum(e.weight for e in cycle))
+
+    readings = req.readings
+    base = {p: int(dist[p]) for p in nodes}
+    # 上界：基准可行解自身的最大偏差必为可行 e（该赋值即见证）
+    hi = max(abs(base[p] - readings[p]) for p in req.measure_points)
+
+    def feasible_at(bound: int) -> bool:
+        aug = [*edges, *_reading_edges(req.measure_points, readings, anchor, bound)]
+        _, _, bad = _bellman_ford(nodes, aug, anchor)
+        return bad is None
+
+    # 单调可行性上的二分：feasible_at(e) 为真 ⇒ 更大的 e 也为真
+    lo = 0
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if feasible_at(mid):
+            hi = mid
+        else:
+            lo = mid + 1
+    best = lo
+
+    # 最小 e 图上的最短路坐标：同一组满足全部约束、基准点为 0 且
+    # 所有测点 |坐标 − 读数| ≤ e 的可行校正坐标
+    final_edges = [*edges, *_reading_edges(req.measure_points, readings, anchor, best)]
+    final_dist, _, _ = _bellman_ford(nodes, final_edges, anchor)
+    coordinates = {p: int(final_dist[p]) for p in nodes}
+    corrections = {p: coordinates[p] - readings[p] for p in req.measure_points}
+    return SolveResult(True, coordinates, [], 0, e=best, corrections=corrections)

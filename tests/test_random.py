@@ -10,8 +10,8 @@ from __future__ import annotations
 import itertools
 import random
 
-from app.schemas import ChainRequest, ConstraintIn
-from app.solver import ValidationError, solve, solve_ranges
+from app.schemas import ChainRequest, ConstraintIn, ReconcileRequest
+from app.solver import ValidationError, solve, solve_ranges, solve_reconcile
 
 
 def brute_force_solutions(datum, measure, constraints):
@@ -131,3 +131,46 @@ def test_random_ranges_match_brute_force_extrema():
             assert isinstance(lo, int) and isinstance(hi, int)
         checked += 1
     assert checked > 100  # 大多数随机实例可行，保证确实比对了紧界
+
+
+def test_random_reconcile_matches_brute_force():
+    """reconcile 的最小 e 与暴力枚举的真实最优值一致。
+
+    暴力枚举的坐标界覆盖全部可行赋值（任何可行坐标的绝对值都不超过
+    所有边权绝对值之和），故枚举上的最小最大偏差即全局最优 e。
+    """
+    rng = random.Random(770031)
+    checked = 0
+    for _ in range(80):
+        datum, measure, constraints = random_instance(rng)
+        readings = {p: rng.randint(-6, 6) for p in measure}
+        req_obj = ReconcileRequest(
+            datum_points=datum,
+            measure_points=measure,
+            constraints=constraints,
+            readings=readings,
+        )
+        res = solve_reconcile(req_obj)
+
+        solutions = list(brute_force_solutions(datum, measure, constraints))
+        if not solutions:
+            assert not res.feasible
+            continue
+
+        assert res.feasible
+        # 暴力最优 e：所有可行赋值中“最大单点偏差”的最小值
+        expected_e = min(
+            max(abs(s[p] - readings[p]) for p in measure) for s in solutions
+        )
+        assert res.e == expected_e, (
+            f"e mismatch: got {res.e}, want {expected_e}, readings={readings}, "
+            f"constraints={[(c.start, c.end, c.lower, c.upper) for c in constraints]}"
+        )
+        # 返回坐标全局可行（含基准点为 0），且自身就达到 e
+        assert returned_coords_valid(datum, measure, constraints, res.coordinates)
+        for p in measure:
+            assert res.corrections[p] == res.coordinates[p] - readings[p]
+            assert abs(res.corrections[p]) <= res.e
+        assert max(abs(res.corrections[p]) for p in measure) == res.e
+        checked += 1
+    assert checked > 50  # 大多数随机实例可行，保证确实比对了最优 e
